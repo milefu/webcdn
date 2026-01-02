@@ -74,6 +74,58 @@ class ChinaStockMonitor:
         
         logger.info("沪深主板量化监控系统初始化完成")
 
+    def get_active_stocks(self):
+        """新增方法：获取活跃股票列表"""
+        try:
+            logger.info("开始筛选活跃股票...")
+            self.safe_request()
+            
+            # 获取A股实时数据
+            spot_data = ak.stock_zh_a_spot_em()
+            
+            if spot_data is None or spot_data.empty:
+                logger.warning("获取实时行情数据为空，使用默认股票")
+                return self.get_default_stocks()
+            
+            # 数据清洗
+            spot_data = spot_data.copy()
+            numeric_cols = ['最新价', '涨跌幅', '成交量', '成交额']
+            for col in numeric_cols:
+                if col in spot_data.columns:
+                    spot_data[col] = pd.to_numeric(spot_data[col], errors='coerce')
+            
+            # 过滤条件
+            filtered = spot_data[
+                (spot_data['成交额'] > VOLUME_THRESHOLD) &
+                (spot_data['最新价'] > MIN_PRICE) &
+                (spot_data['最新价'] < MAX_PRICE) &
+                (~spot_data['代码'].str.startswith(('300', '688', '8')))  # 排除创业板、科创板和北交所
+            ].sort_values('成交额', ascending=False)
+            
+            if filtered.empty:
+                logger.warning("有效股票列表为空，使用默认股票")
+                return self.get_default_stocks()
+            
+            # 格式化股票代码
+            stocks = []
+            for _, row in filtered.head(TOP_N_STOCKS).iterrows():
+                code = row['代码']
+                stocks.append(f"{code}.SH" if code.startswith('6') else f"{code}.SZ")
+            
+            logger.info(f"获取活跃股票列表成功: {len(stocks)}只")
+            return stocks
+            
+        except Exception as e:
+            logger.error(f"获取股票列表异常: {e}")
+            return self.get_default_stocks()
+    
+    def get_default_stocks(self):
+        """获取默认蓝筹股列表"""
+        return [
+            '600036.SH', '601318.SH', '600519.SH', '000858.SZ',
+            '000333.SZ', '000651.SZ', '600276.SH', '601888.SH'
+        ]
+
     def safe_request(self):
         """安全的请求控制"""
         current_time = time.time()
