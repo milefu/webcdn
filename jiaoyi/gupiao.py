@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-中国股市专业监控系统 - 网络容错版
-严格保留原始信号条件，增强网络异常处理
+中国股市专业监控系统 - 动态币种逻辑对齐版
+1. 信号逻辑：完全对齐《动态热门币种监控.py》的波段动能与背离算法
+2. 运行环境：适配阿里云，通过 Cloudflare Workers 中转发送 TG 信号
 """
 
-import os
-import sys
 import time
 import datetime
 import logging
@@ -17,563 +16,203 @@ from threading import Lock
 from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
-# 1. 配置参数（严格保持原始信号条件）
+# 1. 核心配置（对齐币种监控参数）
 # ==========================================
-# 信号参数（完全保持动态热门币种监控的原始设置）
-SIGNAL_PARAMS = {
-    'MA_SHORT': 5,
-    'MA_MEDIUM': 20,
-    'MA_LONG': 55,
-    'MA_XLONG': 144,
-    'MACD_FAST': 12,
-    'MACD_SLOW': 26,
-    'MACD_SIGNAL': 9,
-    'RSI_SHORT': 6,
-    'RSI_MEDIUM': 21,
-    'RSI_LONG': 89,
-    'RSI_OVERBOUGHT': 70,
-    'RSI_OVERSOLD': 30,
-    'VOLUME_RATIO': 1.5,
-    'TREND_STRONG': 0.6,
-    'TREND_MEDIUM': 0.3,
-    'DIVERGENCE_LOOKBACK': 30
+TG_CONFIG = {
+    'TOKEN': '8553821769:AAHysPPPMydLiF1A1l2ab8xRrrBWfSv-kno',
+    'CHAT_ID': '406894294',
+    'PROXY_DOMAIN': 'gupiao.345369.xyz'  # 你的 CF 中转地址
 }
 
-# 监控参数
-TOP_N_STOCKS = 50
-VOLUME_THRESHOLD = 5e8
-MIN_PRICE = 2.0
-MAX_PRICE = 500.0
-CACHE_DURATION = 300
-REQUEST_DELAY = 1.0
-
-# 时间周期配置
+# 监控周期映射（对齐 HTF 过滤逻辑）
 TIMEFRAMES = ['5', '15', '30', '60', '日线']
-HTF_MAP = {'5': '15', '15': '30', '30': '60', '60': '日线', '日线': '周线'}
+HTF_MAP = {
+    '5': '30',
+    '15': '60',
+    '30': '60',
+    '60': '日线',
+    '日线': '周线'
+}
+
+SIGNAL_DESC = {
+    "T0": "趋势顺势：均线与RSI共振确认",
+    "T0+精品": "精品收缩：动能回调衰竭后的高胜率爆发",
+    "S1": "强势突破：价格站稳核心均线簇",
+    "S2": "生命回测：大周期关键趋势位支撑",
+    "M底背": "MACD底背离：价格与动能底部的终极反转",
+    "R底背": "RSI底背离：强弱指标显示下跌动能枯竭"
+}
+
+TOP_N_STOCKS = 50       # 监控成交额前50名
+VOLUME_THRESHOLD = 5e8  # 5亿成交额门槛
+RISK_RATIO = 0.8        # 风险系数（用于杠杆建议参考）
 
 # ==========================================
-# 2. 多通道通知系统（解决网络封锁问题）
+# 2. 技术引擎（对齐币种监控算法）
 # ==========================================
-class NotificationSystem:
-    def __init__(self):
-        self.channels = [
-            TelegramChannel(),
-            EmailChannel(),
-            WebhookChannel(),
-            LocalFileChannel()
-        ]
-        self.fallback_order = [0, 3, 1, 2]  # 通道优先级顺序
-        self.logger = logging.getLogger(__name__)
-    
-    def send_alert(self, message):
-        """多通道发送警报（自动故障转移）"""
-        last_error = None
-        for channel_idx in self.fallback_order:
-            try:
-                result = self.channels[channel_idx].send(message)
-                if result:
-                    return True
-            except Exception as e:
-                last_error = e
-                continue
+class MasterQuantEngine:
+    def rma(self, series, period):
+        """对齐 TradingView 的 RMA 算法"""
+        return series.ewm(alpha=1/period, adjust=False).mean()
+
+    def calc_indicators(self, df):
+        """指标参数完全对齐币种监控"""
+        if df is None or len(df) < 150: return None
+        c, h, l = df['close'], df['high'], df['low']
         
-        self.logger.error(f"所有通知通道发送失败: {last_error}")
-        return False
-
-class TelegramChannel:
-    def __init__(self):
-        self.token = '8553821769:AAHysPPPMydLiF1A1l2ab8xRrrBWfSv-kno'
-        self.chat_id = '406894294'
-        self.timeout = 10
-    
-    def send(self, message):
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={
-                    'chat_id': self.chat_id,
-                    'text': message,
-                    'parse_mode': 'Markdown',
-                    'disable_web_page_preview': True
-                },
-                timeout=self.timeout
-            )
-            return response.status_code == 200
-        except Exception:
-            return False
-
-class EmailChannel:
-    def send(self, message):
-        """邮件通知通道（需配置SMTP）"""
-        # 实现邮件发送逻辑
-        return False  # 示例中暂不实现
-
-class WebhookChannel:
-    def send(self, message):
-        """Webhook通知通道"""
-        # 实现Webhook发送逻辑
-        return False  # 示例中暂不实现
-
-class LocalFileChannel:
-    def __init__(self):
-        self.log_file = "alerts.log"
-    
-    def send(self, message):
-        """本地文件备份通道"""
-        try:
-            with open(self.log_file, 'a', encoding='utf-8') as f:
-                f.write(f"\n[{datetime.datetime.now()}] {message}")
-            return True
-        except Exception:
-            return False
-
-# ==========================================
-# 3. 专业信号引擎（严格保持原始条件）
-# ==========================================
-class ProfessionalSignalEngine:
-    def __init__(self):
-        self.params = SIGNAL_PARAMS
-        self.logger = logging.getLogger(__name__)
-    
-    def calc_technical_indicators(self, df):
-        """计算技术指标（严格保持原始逻辑）"""
-        if df is None or len(df) < 100:
-            return None
-            
-        try:
-            # 计算均线（保持原始参数）
-            df['ma5'] = df['close'].rolling(self.params['MA_SHORT']).mean()
-            df['ma20'] = df['close'].rolling(self.params['MA_MEDIUM']).mean()
-            df['ma55'] = df['close'].rolling(self.params['MA_LONG']).mean()
-            df['ma144'] = df['close'].rolling(self.params['MA_XLONG']).mean()
-            
-            # 计算MACD（保持原始参数）
-            exp1 = df['close'].ewm(span=self.params['MACD_FAST'], adjust=False).mean()
-            exp2 = df['close'].ewm(span=self.params['MACD_SLOW'], adjust=False).mean()
-            df['macd'] = exp1 - exp2
-            df['macd_signal'] = df['macd'].ewm(span=self.params['MACD_SIGNAL'], adjust=False).mean()
-            df['macd_hist'] = df['macd'] - df['macd_signal']
-            
-            # 计算RSI（保持原始参数）
-            delta = df['close'].diff()
-            gain = delta.where(delta > 0, 0)
-            loss = -delta.where(delta < 0, 0)
-            
-            avg_gain = gain.rolling(self.params['RSI_SHORT']).mean()
-            avg_loss = loss.rolling(self.params['RSI_SHORT']).mean()
-            rs = avg_gain / avg_loss
-            df['rsi6'] = 100 - (100 / (1 + rs))
-            
-            avg_gain = gain.rolling(self.params['RSI_MEDIUM']).mean()
-            avg_loss = loss.rolling(self.params['RSI_MEDIUM']).mean()
-            rs = avg_gain / avg_loss
-            df['rsi21'] = 100 - (100 / (1 + rs))
-            
-            avg_gain = gain.rolling(self.params['RSI_LONG']).mean()
-            avg_loss = loss.rolling(self.params['RSI_LONG']).mean()
-            rs = avg_gain / avg_loss
-            df['rsi89'] = 100 - (100 / (1 + rs))
-            
-            # 计算成交量指标
-            df['vol_ma20'] = df['volume'].rolling(20).mean()
-            df['vol_ratio'] = df['volume'] / df['vol_ma20']
-            
-            return df
-            
-        except Exception as e:
-            self.logger.error(f"计算技术指标异常: {e}")
-            return None
-    
-    def analyze_signals(self, df, htf_df=None):
-        """分析做多信号（严格保持原始条件）"""
-        if df is None or len(df) < 100:
-            return None
-            
-        try:
-            current = df.iloc[-1]
-            prev = df.iloc[-2]
-            
-            signals = []
-            
-            # 1. 趋势顺势信号 (T0)
-            if (current['close'] > current['ma20'] > current['ma55'] and
-                current['rsi6'] > 50 and current['rsi6'] < self.params['RSI_OVERBOUGHT'] and
-                current['macd'] > current['macd_signal']):
-                signals.append("T0")
-            
-            # 2. 精品收缩信号 (T0+)
-            if (len(signals) > 0 and 
-                current['vol_ratio'] > self.params['VOLUME_RATIO'] and
-                current['rsi6'] > 40 and current['rsi6'] < 65):
-                signals.append("T0+")
-            
-            # 3. 强势突破信号 (S1)
-            if (current['close'] > current['ma55'] and
-                current['rsi21'] > 50 and
-                current['vol_ratio'] > self.params['VOLUME_RATIO']):
-                signals.append("S1")
-            
-            # 4. 生命回测信号 (S2)
-            if (current['close'] > current['ma144'] and
-                current['rsi89'] < 45 and
-                current['close'] > df['low'].rolling(20).mean().iloc[-1]):
-                signals.append("S2")
-            
-            # 5. MACD底背离
-            if self.check_divergence(df, 'macd', 'bullish'):
-                signals.append("M底背")
-            
-            # 6. RSI底背离
-            if self.check_divergence(df, 'rsi6', 'bullish'):
-                signals.append("R底背")
-            
-            if not signals:
-                return None
-                
-            # 计算止损位（保持原始逻辑）
-            support_level = min(
-                df['low'].tail(20).min(),
-                current['ma20'],
-                current['ma55']
-            )
-            risk_ratio = (current['close'] - support_level) / current['close']
-            
-            return {
-                'time': current.name if hasattr(current, 'name') else datetime.datetime.now(),
-                'price': current['close'],
-                'support': support_level,
-                'signals': signals,
-                'rsi': current['rsi6'],
-                'volume_ratio': current['vol_ratio'],
-                'risk_ratio': risk_ratio
-            }
-            
-        except Exception as e:
-            self.logger.error(f"分析信号异常: {e}")
-            return None
-    
-    def check_divergence(self, df, indicator, type='bullish'):
-        """检查背离（保持原始逻辑）"""
-        if len(df) < self.params['DIVERGENCE_LOOKBACK']:
-            return False
-            
-        prices = df['close'].tail(self.params['DIVERGENCE_LOOKBACK']).values
-        indicator_values = df[indicator].tail(self.params['DIVERGENCE_LOOKBACK']).values
+        # 均线簇：55, 89, 144
+        df['s55'] = c.rolling(55).mean()
+        df['s89'] = c.rolling(89).mean()
+        df['s144'] = c.rolling(144).mean()
         
-        if type == 'bullish':
-            # 底背离：价格新低，指标抬高
-            price_lows = []
-            indicator_lows = []
-            
-            for i in range(1, len(prices)-1):
-                if prices[i] < prices[i-1] and prices[i] < prices[i+1]:
-                    price_lows.append((i, prices[i]))
-                if indicator_values[i] < indicator_values[i-1] and indicator_values[i] < indicator_values[i+1]:
-                    indicator_lows.append((i, indicator_values[i]))
-            
-            if len(price_lows) >= 2 and len(indicator_lows) >= 2:
-                latest_price_low = price_lows[-1][1]
-                prev_price_low = price_lows[-2][1]
-                latest_indicator_low = indicator_lows[-1][1]
-                prev_indicator_low = indicator_lows[-2][1]
-                
-                return (latest_price_low < prev_price_low and 
-                       latest_indicator_low > prev_indicator_low)
+        # MACD：34, 89, 13
+        e1, e2 = c.ewm(span=34, adjust=False).mean(), c.ewm(span=89, adjust=False).mean()
+        df['macd'] = e1 - e2
+        df['sig'] = df['macd'].ewm(span=13, adjust=False).mean()
+        df['hist'] = df['macd'] - df['sig']
         
-        return False
+        # RSI：21, 34, 89 (TradingView RMA版)
+        def tv_rsi(s, p):
+            diff = s.diff()
+            up = self.rma(diff.where(diff > 0, 0), p)
+            down = self.rma(-diff.where(diff < 0, 0), p)
+            return 100 - (100 / (1 + up/down))
+
+        df['rsi21'], df['r34'], df['r89'] = tv_rsi(c, 21), tv_rsi(c, 34), tv_rsi(c, 89)
+        return df
+
+    def analyze_wave_logic(self, df, htf_df):
+        """核心波段逻辑：对齐 analyze_wave_logic"""
+        if df is None or htf_df is None: return None
+        idx = len(df) - 1 
+        hist, high, low, close, rsi = df['hist'].values, df['high'].values, df['low'].values, df['close'].values, df['rsi21'].values
+        
+        # 提取波峰波谷
+        def get_wave_peaks(h_list, p_h, p_l, r_list):
+            waves = []
+            cur = {'type': 0, 'peak_h': 0, 'price': 0, 'rsi': 50}
+            for j in range(max(0, idx-140), idx+1):
+                w_type = 1 if h_list[j] > 0 else -1
+                if w_type != cur['type']:
+                    if cur['type'] != 0: waves.append(cur)
+                    cur = {'type': w_type, 'peak_h': h_list[j], 'price': p_h[j] if w_type==1 else p_l[j], 'rsi': r_list[j]}
+                else:
+                    if (w_type == 1 and h_list[j] > cur['peak_h']) or (w_type == -1 and h_list[j] < cur['peak_h']):
+                        cur.update({'peak_h': h_list[j], 'price': p_h[j] if w_type==1 else p_l[j], 'rsi': r_list[j]})
+            return waves, cur
+
+        waves, cur_w = get_wave_peaks(hist, high, low, rsi)
+        if not waves: return None
+        prev_same = next((w for w in reversed(waves) if w['type'] == cur_w['type']), None)
+        prev_oppo = next((w for w in reversed(waves) if w['type'] != cur_w['type']), None)
+
+        # MACD 勾头检测 (仅监控做多信号)
+        m_hook_up = (cur_w['type'] == -1 and hist[idx] > hist[idx-1]) 
+        if not m_hook_up: return None
+
+        # 大周期 HTF 过滤
+        ht_h, ht_p = htf_df['hist'].iloc[-1], htf_df['hist'].iloc[-2]
+        htf_bull_ok = (ht_h > 0) or (ht_h < 0 and ht_h > ht_p)
+        if not htf_bull_ok: return None
+
+        sigs = []
+        s55, s89, s144 = df['s55'].iloc[idx], df['s89'].iloc[idx], df['s144'].iloc[idx]
+        r34, r89 = df['r34'].iloc[idx], df['r89'].iloc[idx]
+        is_contract = abs(cur_w['peak_h']) < abs(prev_oppo['peak_h']) if prev_oppo else False
+
+        # 信号组合判定
+        if prev_same and close[idx] < prev_same['price']:
+            if cur_w['peak_h'] > prev_same['peak_h']: sigs.append("M底背")
+            if cur_w['rsi'] > prev_same['rsi']: sigs.append("R底背")
+        if s55 > s89 and r34 > r89: sigs.append("T0+精品" if is_contract else "T0")
+        if r89 > 50 and r34 < r89 and close[idx] > s144: sigs.append("S1")
+        if r89 < 50 and r34 < r89 and close[idx] > s144: sigs.append("S2")
+
+        if not sigs: return None
+        
+        sl = low[idx-5:idx+1].min() # 简单支撑止损
+        return {
+            'time': df['datetime'].iloc[idx], 
+            'price': close[idx], 
+            'sl': sl, 
+            'side': "LONG", 
+            'types': list(set(sigs))
+        }
 
 # ==========================================
-# 4. 中国股市监控引擎（网络容错版）
+# 3. 股票数据与监控系统
 # ==========================================
 class ChinaStockMonitor:
     def __init__(self):
-        self.signal_engine = ProfessionalSignalEngine()
-        self.notifier = NotificationSystem()
-        self.stock_cache = {}
-        self.htf_cache = {}
+        self.engine = MasterQuantEngine()
         self.processed_alerts = {}
-        self.cache_lock = Lock()
-        self.last_refresh_time = 0
-        self.active_stocks = []
-        self.executor = ThreadPoolExecutor(max_workers=5)
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.getLogger("StockMaster")
+
+    def send_tg_via_proxy(self, symbol, tf, sig):
+        """通过 Cloudflare 中转发送信号"""
+        bj = sig['time'].strftime('%m-%d %H:%M')
+        details = "\n".join([f"• *{t}*: {SIGNAL_DESC.get(t, '共振确认')}" for t in sig['types']])
+        msg = (f"🟢【A股多单共振】\n━━━━━━━━━━━━━━\n🔥 品种: `{symbol}` | 周期: `{tf}`\n💰 价格: `{sig['price']:.2f}`\n"
+               f"🛡️ 止损: `{sig['sl']:.2f}`\n━━━━━━━━━━━━━━\n📊 信号详情:\n{details}\n━━━━━━━━━━━━━━\n⏰ 时间(BJ): {bj}")
         
-        self.logger.info("中国股市专业监控系统初始化完成")
-
-    def refresh_stock_list(self):
-        """刷新股票列表（带网络异常处理）"""
+        url = f"https://{TG_CONFIG['PROXY_DOMAIN']}/bot{TG_CONFIG['TOKEN']}/sendMessage"
         try:
-            self.logger.info("开始刷新股票列表...")
-            start_time = time.time()
-            
-            # 获取A股实时数据
-            spot_data = ak.stock_zh_a_spot_em()
-            
-            if spot_data is None or spot_data.empty:
-                self.logger.warning("获取实时行情数据为空，使用默认股票")
-                self.active_stocks = self.get_default_stocks()
-                return
-            
-            # 数据清洗
-            spot_data = spot_data.copy()
-            numeric_cols = ['最新价', '涨跌幅', '成交量', '成交额']
-            for col in numeric_cols:
-                if col in spot_data.columns:
-                    spot_data[col] = pd.to_numeric(spot_data[col], errors='coerce')
-            
-            # 过滤主板股票
-            main_board = spot_data[
-                (~spot_data['代码'].str.startswith(('300', '688', '8'), na=False)) &
-                (spot_data['成交额'] > VOLUME_THRESHOLD) &
-                (spot_data['最新价'] > MIN_PRICE) &
-                (spot_data['最新价'] < MAX_PRICE)
-            ].sort_values('成交额', ascending=False)
-            
-            if main_board.empty:
-                self.logger.warning("有效股票列表为空，使用默认股票")
-                self.active_stocks = self.get_default_stocks()
-                return
-            
-            # 格式化股票代码
-            stocks = []
-            for _, row in main_board.head(TOP_N_STOCKS).iterrows():
-                code = row['代码']
-                stocks.append(f"{code}.SH" if code.startswith('6') else f"{code}.SZ")
-            
-            self.active_stocks = stocks
-            self.last_refresh_time = time.time()
-            self.logger.info(f"股票列表刷新完成，耗时{(time.time()-start_time):.2f}秒")
-            self.logger.info(f"当前监控股票数量: {len(stocks)}")
-            
+            requests.post(url, json={'chat_id': TG_CONFIG['CHAT_ID'], 'text': msg, 'parse_mode': 'Markdown'}, timeout=10)
+            return True
         except Exception as e:
-            self.logger.error(f"刷新股票列表异常: {e}")
-            self.active_stocks = self.get_default_stocks()
-
-    def get_default_stocks(self):
-        """获取默认蓝筹股列表"""
-        return [
-            '600036.SH', '601318.SH', '600519.SH', '000858.SZ',
-            '000333.SZ', '000651.SZ', '600276.SH', '601888.SH'
-        ]
-
-    def get_stock_data(self, symbol, period='日线', count=100):
-        """获取股票K线数据（带缓存和重试）"""
-        try:
-            # 解析股票代码
-            code = symbol.split('.')[0]
-            
-            cache_key = f"{symbol}_{period}"
-            current_time = time.time()
-            
-            # 检查缓存
-            with self.cache_lock:
-                if cache_key in self.stock_cache:
-                    cached_data, cache_time = self.stock_cache[cache_key]
-                    if current_time - cache_time < CACHE_DURATION:
-                        return cached_data
-            
-            df = None
-            
-            if period == '日线':
-                # 获取日线数据
-                df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
-                    adjust="hfq",
-                    start_date=(datetime.datetime.now() - datetime.timedelta(days=200)).strftime('%Y%m%d')
-                )
-                if df is not None and not df.empty:
-                    df = df.rename(columns={
-                        '日期': 'datetime', '开盘': 'open', '收盘': 'close',
-                        '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount'
-                    })
-            else:
-                # 获取分钟线数据
-                try:
-                    period_map = {'5': '5', '15': '15', '30': '30', '60': '60'}
-                    if period in period_map:
-                        df = ak.stock_zh_a_hist_min_em(
-                            symbol=code,
-                            period=period_map[period],
-                            adjust='hfq'
-                        )
-                        if df is not None and not df.empty:
-                            df = df.rename(columns={
-                                '时间': 'datetime', '开盘': 'open', '收盘': 'close',
-                                '最高': 'high', '最低': 'low', '成交量': 'volume'
-                            })
-                except Exception as e:
-                    self.logger.warning(f"获取{symbol} {period}分钟数据失败: {e}")
-                    return None
-            
-            if df is None or df.empty:
-                self.logger.warning(f"获取{symbol} {period}数据为空")
-                return None
-            
-            # 数据预处理
-            df = df.sort_values('datetime').reset_index(drop=True)
-            df['datetime'] = pd.to_datetime(df['datetime'])
-            
-            # 数值列处理
-            numeric_cols = ['open', 'close', 'high', 'low', 'volume']
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-            df = df.dropna(subset=['close'])
-            
-            if len(df) < 50:
-                self.logger.warning(f"{symbol} {period}数据量不足: {len(df)}条")
-                return None
-            
-            # 计算技术指标
-            df = self.signal_engine.calc_technical_indicators(df)
-            
-            # 更新缓存
-            with self.cache_lock:
-                self.stock_cache[cache_key] = (df.tail(count), current_time)
-            
-            return df.tail(count)
-            
-        except Exception as e:
-            self.logger.error(f"获取{symbol}数据异常: {e}")
-            return None
-
-    def send_alert(self, symbol, timeframe, signal):
-        """发送做多信号警报（多通道）"""
-        try:
-            # 解析股票信息
-            code = symbol.split('.')[0]
-            exchange = "沪市" if symbol.endswith('.SH') else "深市"
-            
-            # 获取股票名称
-            stock_name = "未知股票"
-            try:
-                stock_info = ak.stock_individual_info_em(symbol=code)
-                if not stock_info.empty:
-                    name_row = stock_info[stock_info['item'] == '股票名称']
-                    if not name_row.empty:
-                        stock_name = name_row['value'].iloc[0]
-            except:
-                pass
-            
-            # 格式化时间
-            if isinstance(signal['time'], (int, float)):
-                signal_time = datetime.datetime.fromtimestamp(signal['time']).strftime('%m-%d %H:%M')
-            elif hasattr(signal['time'], 'strftime'):
-                signal_time = signal['time'].strftime('%m-%d %H:%M')
-            else:
-                signal_time = str(signal['time'])
-            
-            # 构建消息
-            signals_text = "\n".join([f"• {sig}" for sig in signal['signals']])
-            
-            message = f"""
-🎯【沪深主板做多信号警报】🎯
-━━━━━━━━━━━━━━━━━━
-📈 股票: {stock_name}({symbol})
-🏢 市场: {exchange}
-⏰ 周期: {timeframe} | 时间: {signal_time}
-💰 当前价格: ¥{signal['price']:.2f}
-🛡️ 支撑位置: ¥{signal['support']:.2f}
-📊 RSI指标: {signal['rsi']:.1f}
-📈 量比: {signal['volume_ratio']:.1f}x
-🔰 风险比率: {signal['risk_ratio']:.1%}
-━━━━━━━━━━━━━━━━━━
-📋 信号详情:
-{signals_text}
-━━━━━━━━━━━━━━━━━━
-⚠️ 风险提示: 投资有风险，决策需谨慎
-            """
-            
-            # 通过多通道发送
-            return self.notifier.send_alert(message)
-            
-        except Exception as e:
-            self.logger.error(f"构建警报消息异常: {e}")
+            self.logger.error(f"发送失败: {e}")
             return False
 
-    def monitor_symbol(self, symbol):
-        """监控单个股票"""
-        for timeframe in TIMEFRAMES:
-            try:
-                # 获取当前周期数据
-                current_data = self.get_stock_data(symbol, timeframe, 150)
-                if current_data is None:
-                    continue
-                
-                # 获取大周期数据
-                htf_timeframe = HTF_MAP.get(timeframe, '日线')
-                htf_data = self.get_stock_data(symbol, htf_timeframe, 100)
-                
-                # 分析信号
-                signal = self.signal_engine.analyze_signals(current_data, htf_data)
-                if signal:
-                    alert_id = f"{symbol}_{timeframe}_{signal['time']}"
-                    if alert_id not in self.processed_alerts:
-                        if self.send_alert(symbol, timeframe, signal):
-                            self.processed_alerts[alert_id] = time.time()
-                            self.logger.info(f"🔔 发现信号: {symbol} {timeframe} {signal['signals']}")
-                
-            except Exception as e:
-                self.logger.error(f"分析{symbol}{timeframe}异常: {e}")
-                continue
-
-    def run_monitoring(self):
-        """主监控循环"""
-        self.logger.info("🚀 沪深主板做多信号监控系统启动")
-        
-        cycle_count = 0
-        
+    def get_data(self, symbol, tf):
+        """适配 AKShare 的 K 线获取"""
+        code = symbol.split('.')[0]
         try:
-            while True:
-                try:
-                    cycle_count += 1
-                    current_time = time.time()
-                    
-                    # 定期刷新股票列表（每2小时）
-                    if current_time - self.last_refresh_time > 7200 or not self.active_stocks:
-                        self.refresh_stock_list()
-                    
-                    self.logger.info(f"📈 开始第{cycle_count}轮监控，股票数量: {len(self.active_stocks)}")
-                    
-                    # 使用线程池并行监控
-                    list(self.executor.map(self.monitor_symbol, self.active_stocks))
-                    
-                    self.logger.info(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 本轮监控完成，等待下一轮...")
-                    time.sleep(60)  # 1分钟间隔
-                    
-                except KeyboardInterrupt:
-                    self.logger.info("👋 用户中断，停止监控")
-                    break
-                except Exception as e:
-                    self.logger.error(f"⚠️ 监控循环异常: {e}")
-                    time.sleep(300)
-        
-        except Exception as e:
-            self.logger.error(f"监控系统异常终止: {e}")
-            sys.exit(1)
+            if tf == '日线':
+                df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="hfq")
+                df = df.rename(columns={'日期':'datetime','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume'})
+            elif tf == '周线':
+                df = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="hfq")
+                df = df.rename(columns={'日期':'datetime','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume'})
+            else:
+                df = ak.stock_zh_a_hist_min_em(symbol=code, period=tf, adjust='hfq')
+                df = df.rename(columns={'时间':'datetime','开盘':'open','收盘':'close','最高':'high','最低':'low','成交量':'volume'})
+            
+            if df is None or df.empty: return None
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            return self.engine.calc_indicators(df)
+        except: return None
 
-# ==========================================
-# 5. 启动监控
-# ==========================================
+    def run(self):
+        self.logger.info("🚀 股市大师版监控启动 | 逻辑对齐币种热门脚本")
+        while True:
+            try:
+                # 刷新热门榜单
+                spot = ak.stock_zh_a_spot_em()
+                spot['成交额'] = pd.to_numeric(spot['成交额'], errors='coerce')
+                active_list = spot[spot['成交额'] > VOLUME_THRESHOLD].sort_values('成交额', ascending=False).head(TOP_N_STOCKS)
+                symbols = [f"{c}.SH" if c.startswith('6') else f"{c}.SZ" for c in active_list['代码']]
+
+                for sym in symbols:
+                    for tf in TIMEFRAMES:
+                        df = self.get_data(sym, tf)
+                        htf_tf = HTF_MAP.get(tf, '日线')
+                        htf_df = self.get_data(sym, htf_tf)
+                        
+                        res = self.engine.analyze_wave_logic(df, htf_df)
+                        if res:
+                            alert_id = f"{sym}_{tf}_{res['time']}"
+                            if alert_id not in self.processed_alerts:
+                                if self.send_tg_via_proxy(sym, tf, res):
+                                    self.processed_alerts[alert_id] = True
+                                    print(f"🔔 发现信号: {sym} {tf} {res['types']}")
+                    time.sleep(0.5) # 防止请求过快
+                
+                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 轮询结束，等待中...")
+                time.sleep(60)
+            except Exception as e:
+                self.logger.error(f"系统循环异常: {e}")
+                time.sleep(30)
+
 if __name__ == "__main__":
-    # 配置日志
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler('stock_monitor.log'),
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
-    logger = logging.getLogger(__name__)
-    
-    # 创建并运行监控器
-    monitor = ChinaStockMonitor()
-    try:
-        monitor.run_monitoring()
-    except KeyboardInterrupt:
-        logger.info("监控系统正常退出")
-    except Exception as e:
-        logger.error(f"监控系统异常终止: {e}")
+    logging.basicConfig(level=logging.INFO)
+    ChinaStockMonitor().run()
